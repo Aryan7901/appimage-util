@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AppImage Uninstaller
+Comment=Remove an AppImage app, its launchers and the data it left behind
+Exec=@BINDIR@/appimage-uninstall
+Icon=user-trash-full
+Terminal=false
+Categories=System;

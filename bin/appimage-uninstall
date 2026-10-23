@@ -1,0 +1,323 @@
+#!/usr/bin/python3
+"""Completely remove an AppImage app installed under ~/AppImages.
+
+Removes:
+  - ~/AppImages/<app>/ (the AppImage and its icon)
+  - every launcher that runs it, whoever made it (appimage-install, Pin It, the
+    app's own self-integration), plus autostart entries
+  - its URL/file associations in mimeapps.list and its dock favourite
+  - the data it left behind (config, data, cache, state), after you tick which
+
+Usage:
+    appimage-uninstall                 pick an installed app from a list
+    appimage-uninstall NAME|PATH       uninstall that app (folder name or AppImage path)
+    appimage-uninstall --dry-run [NAME]  print what would be removed, change nothing
+"""
+
+import configparser
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = HOME / "AppImages"
+APPS = HOME / ".local/share/applications"
+DATA_DIRS = [HOME / ".config", HOME / ".local/share", HOME / ".cache", HOME / ".local/state"]
+MIMEAPPS = [HOME / ".config/mimeapps.list", APPS / "mimeapps.list"]
+# Words too common to identify an app's data folder on their own.
+GENERIC = {"app", "apps", "desktop", "linux", "launcher", "studio", "game", "games",
+           "client", "appimage", "x86", "x64", "amd64", "aarch64", "arm64", "the", "for",
+           "editor", "player", "browser", "manager", "tool", "tools", "free", "pro"}
+# Never offer these, however well they match.
+PROTECTED = {HOME, ROOT, APPS, HOME / ".local", *DATA_DIRS}
+
+DRY_RUN = False
+
+
+# --- dialogs ---------------------------------------------------------------
+
+def zenity(*args):
+    r = subprocess.run(["zenity", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def error(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    if not DRY_RUN:
+        zenity("--error", "--title=AppImage Uninstaller", "--no-markup", f"--text={msg}")
+
+
+def notify(title, body=""):
+    subprocess.run(["notify-send", "--app-name=AppImage Uninstaller",
+                    "--icon=user-trash-full", title, body], check=False)
+
+
+# --- finding things --------------------------------------------------------
+
+def read_entry(path):
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    try:
+        cp.read(path, encoding="utf-8")
+    except (configparser.Error, UnicodeDecodeError):
+        return {}
+    return dict(cp["Desktop Entry"]) if cp.has_section("Desktop Entry") else {}
+
+
+def installed_apps():
+    """{folder: [AppImage paths]} for every app folder under ~/AppImages."""
+    apps = {}
+    if ROOT.is_dir():
+        for d in sorted(ROOT.iterdir()):
+            if d.is_dir():
+                apps[d] = [p for p in d.iterdir() if p.suffix.lower() == ".appimage"]
+    return apps
+
+
+def launchers_for(app_dir):
+    """Launchers (and autostart entries) whose Exec/TryExec runs something in app_dir."""
+    found = []
+    for folder in (APPS, HOME / ".config/autostart"):
+        for f in sorted(folder.glob("*.desktop")) if folder.is_dir() else []:
+            text = f.read_text(errors="replace")
+            if str(app_dir) + "/" in text:
+                found.append(f)
+    return found
+
+
+def tokens(*names):
+    out = set()
+    for n in names:
+        for w in re.split(r"[^a-z0-9]+", (n or "").lower()):
+            w = re.sub(r"\d+$", "", w)  # eglv2 -> eglv, but keep the word
+            if len(w) >= 4 and w not in GENERIC:
+                out.add(w)
+    return out
+
+
+def leftovers(words):
+    """Data folders whose name contains one of the app's distinctive words.
+    Returns [(path, ticked_by_default)]."""
+    hits = []
+    for base in DATA_DIRS:
+        for p in sorted(base.iterdir()) if base.is_dir() else []:
+            flat = re.sub(r"[^a-z0-9]", "", p.name.lower())
+            if any(w in flat for w in words):
+                hits.append((p, True))
+    # ~/.<name> folders are often shared with a CLI install of the same tool.
+    for p in sorted(HOME.iterdir()):
+        if p.name.startswith(".") and p not in PROTECTED:
+            flat = re.sub(r"[^a-z0-9]", "", p.name.lower())
+            if any(w in flat for w in words):
+                hits.append((p, False))
+    icons = HOME / ".local/share/icons"
+    if icons.is_dir():
+        for p in icons.rglob("*"):
+            if p.is_file() and any(w in p.stem.lower().replace("-", "").replace("_", "")
+                                   for w in words):
+                hits.append((p, True))
+    return [(p, tick) for p, tick in hits if p not in PROTECTED]
+
+
+def size(p):
+    try:
+        r = subprocess.run(["du", "-sh", str(p)], capture_output=True, text=True, timeout=20)
+        return r.stdout.split()[0] if r.returncode == 0 else "?"
+    except (subprocess.TimeoutExpired, IndexError):
+        return "large"
+
+
+def running(appimages):
+    pids = []
+    for a in appimages:
+        r = subprocess.run(["pgrep", "-f", str(a)], capture_output=True, text=True)
+        pids += [int(x) for x in r.stdout.split() if int(x) != os.getpid()]
+    return pids
+
+
+# --- removing things -------------------------------------------------------
+
+def remove(p):
+    if DRY_RUN:
+        print(f"  would remove {p}")
+        return
+    if p.is_symlink() or p.is_file():
+        p.unlink(missing_ok=True)
+    elif p.is_dir():
+        shutil.rmtree(p, ignore_errors=True)
+
+
+def scrub_mimeapps(ids):
+    """Drop the removed launchers from every association list."""
+    for f in MIMEAPPS:
+        if not f.exists():
+            continue
+        lines, changed = [], False
+        for line in f.read_text().splitlines():
+            if "=" in line and not line.startswith("["):
+                key, val = line.split("=", 1)
+                kept = [v for v in val.split(";") if v and v not in ids]
+                if kept != [v for v in val.split(";") if v]:
+                    changed = True
+                    if not kept:
+                        continue
+                    line = f"{key}={';'.join(kept)}" + (";" if val.endswith(";") else "")
+            lines.append(line)
+        if changed:
+            if DRY_RUN:
+                print(f"  would drop {', '.join(sorted(ids))} from {f}")
+            else:
+                f.write_text("\n".join(lines) + "\n")
+
+
+def scrub_dock(ids):
+    r = subprocess.run(["gsettings", "get", "org.gnome.shell", "favorite-apps"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return
+    favs = re.findall(r"'([^']+)'", r.stdout)
+    kept = [f for f in favs if f not in ids]
+    if kept != favs:
+        if DRY_RUN:
+            print(f"  would unpin {', '.join(f for f in favs if f in ids)} from the dock")
+        else:
+            value = "[" + ", ".join(f"'{f}'" for f in kept) + "]"
+            subprocess.run(["gsettings", "set", "org.gnome.shell", "favorite-apps", value])
+
+
+# --- flow ------------------------------------------------------------------
+
+def display_name(app_dir, launchers):
+    for l in launchers:
+        name = read_entry(l).get("Name")
+        if name:
+            return name
+    return app_dir.name
+
+
+def pick_app():
+    apps = installed_apps()
+    if not apps:
+        error("No apps installed in ~/AppImages.")
+        return None
+    rows = []
+    for d, images in apps.items():
+        rows += [display_name(d, launchers_for(d)), images[0].name if images else "(no AppImage)", str(d)]
+    rc, out = zenity("--list", "--title=Uninstall an AppImage", "--width=560", "--height=380",
+                     "--text=Choose the app to remove:", "--column=App", "--column=File",
+                     "--column=Path", "--hide-column=3", "--print-column=3", *rows)
+    return Path(out.split("|")[0]) if rc == 0 and out else None
+
+
+def resolve_target(arg):
+    p = Path(arg).expanduser()
+    if p.exists():
+        p = p.resolve()
+        if ROOT in p.parents:
+            # ~/AppImages/<app>/<file> -> ~/AppImages/<app>
+            return ROOT / p.relative_to(ROOT).parts[0]
+    if (ROOT / arg).is_dir():
+        return ROOT / arg
+    # Match by launcher name, e.g. "Epic Games Launcher" or a slug that differs from the folder.
+    for d in installed_apps():
+        if arg.lower() in (display_name(d, launchers_for(d)).lower(),
+                           re.sub(r"[^a-z0-9]+", "-", display_name(d, launchers_for(d)).lower())):
+            return d
+    return None
+
+
+def uninstall(app_dir):
+    images = [p for p in app_dir.iterdir() if p.suffix.lower() == ".appimage"]
+    entries = launchers_for(app_dir)
+    name = display_name(app_dir, entries)
+    meta = [read_entry(e) for e in entries]
+    words = tokens(app_dir.name, name, *(p.stem for p in images),
+                   *(m.get("StartupWMClass") for m in meta), *(m.get("Name") for m in meta))
+    data = leftovers(words)
+
+    if DRY_RUN:
+        print(f"{name}  ({app_dir})\n  match words: {', '.join(sorted(words))}")
+        remove(app_dir)
+        for e in entries:
+            remove(e)
+        for p, tick in data:
+            print(f"  {'[x]' if tick else '[ ]'} {p}  ({size(p)})")
+    else:
+        pids = running(images)
+        if pids:
+            rc, _ = zenity("--question", "--title=App is running", "--no-markup",
+                           f"--text={name} is still running. Quit it and continue?")
+            if rc != 0:
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            time.sleep(2)
+
+        summary = (f"Remove {name}?\n\nAlways removed: {app_dir} and "
+                   f"{len(entries)} launcher{'s' if len(entries) != 1 else ''}.")
+        if data:
+            rows = []
+            for p, tick in data:
+                rows += ["TRUE" if tick else "FALSE", str(p).replace(str(HOME), "~", 1), size(p), str(p)]
+            rc, out = zenity("--list", "--checklist", "--title=Uninstall " + name,
+                             "--width=640", "--height=440", "--no-markup",
+                             f"--text={summary}\n\nAlso delete what it left behind (untick to keep):",
+                             "--ok-label=Uninstall", "--column=Delete", "--column=Location",
+                             "--column=Size", "--column=Path", "--hide-column=4",
+                             "--print-column=4", "--separator=\n", *rows)
+            if rc != 0:
+                return
+            chosen = [Path(x) for x in out.splitlines() if x]
+        else:
+            rc, _ = zenity("--question", "--title=Uninstall " + name, "--no-markup",
+                           "--ok-label=Uninstall", f"--text={summary}")
+            if rc != 0:
+                return
+            chosen = []
+
+        remove(app_dir)
+        for e in entries:
+            remove(e)
+        for p in chosen:
+            if p not in PROTECTED and HOME in p.parents:
+                remove(p)
+
+    ids = {e.name for e in entries}
+    scrub_mimeapps(ids)
+    scrub_dock(ids)
+    if not DRY_RUN:
+        subprocess.run(["update-desktop-database", str(APPS)], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["gtk-update-icon-cache", "-q", "-t", str(HOME / ".local/share/icons/hicolor")],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        notify(f"{name} uninstalled")
+        print(f"uninstalled {name}")
+
+
+def main(argv):
+    global DRY_RUN
+    if argv and argv[0] == "--dry-run":
+        DRY_RUN = True
+        argv = argv[1:]
+    if DRY_RUN and not argv:
+        for d in installed_apps():
+            uninstall(d)
+        return
+    target = resolve_target(argv[0]) if argv else pick_app()
+    if argv and not target:
+        return error(f"No installed app matches '{argv[0]}'.")
+    if target:
+        uninstall(target)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AppImage Installer
+Comment=Install an AppImage into ~/AppImages with a launcher and icon
+Exec=@BINDIR@/appimage-install %F
+Icon=system-software-install
+Terminal=false
+Categories=System;
+MimeType=application/vnd.appimage;application/x-iso9660-appimage;

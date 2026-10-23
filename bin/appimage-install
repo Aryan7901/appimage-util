@@ -1,0 +1,274 @@
+#!/usr/bin/python3
+"""Install an AppImage the way ~/AppImages is laid out by hand:
+
+    ~/AppImages/<slug>/<file>.AppImage
+    ~/AppImages/<slug>/<slug>.png|svg          (pulled out of the AppImage)
+    ~/.local/share/applications/appimage-<slug>.desktop
+
+Usage:
+    appimage-install FILE.AppImage...   install (or update) each file
+    appimage-install                    pick a file in a dialog
+    appimage-install --uninstall SLUG   same as appimage-uninstall SLUG
+
+Opening an AppImage that already lives under ~/AppImages just runs it, so this
+can safely be the default handler for .AppImage files.
+"""
+
+import configparser
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+ROOT = HOME / "AppImages"
+APPS = HOME / ".local/share/applications"
+SELF = Path(__file__).resolve()
+UNINSTALL = SELF.with_name("appimage-uninstall")
+FIELD_CODES = ("%U", "%u", "%F", "%f")
+
+
+# --- dialogs ---------------------------------------------------------------
+
+def zenity(*args):
+    r = subprocess.run(["zenity", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def error(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    zenity("--error", "--title=AppImage Installer", "--no-markup", f"--text={msg}")
+
+
+def notify(title, body, icon=None):
+    cmd = ["notify-send", "--app-name=AppImage Installer", title, body]
+    if icon:
+        cmd.insert(1, f"--icon={icon}")
+    subprocess.run(cmd, check=False)
+
+
+# --- reading the AppImage --------------------------------------------------
+
+def appimage_type(path):
+    with open(path, "rb") as f:
+        head = f.read(11)
+    if head[:4] != b"\x7fELF":
+        return None
+    if head[8:10] == b"AI":
+        return head[10]
+    return 0  # an ELF without the AppImage magic; some still work
+
+
+def extract(appimage, dest, *patterns):
+    """Extract matching paths from the AppImage's own runtime into dest/squashfs-root."""
+    for pat in patterns:
+        subprocess.run([str(appimage), "--appimage-extract", pat], cwd=dest,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=120, check=False)
+    return dest / "squashfs-root"
+
+
+def resolve(root, p):
+    """Follow symlinks inside the extracted tree. Absolute targets point at the
+    build machine and are useless, so they resolve to None."""
+    for _ in range(10):
+        if not p.is_symlink():
+            return p if p.is_file() else None
+        target = os.readlink(p)
+        if target.startswith("/"):
+            return None
+        p = p.parent / target
+    return None
+
+
+def read_desktop(root):
+    candidates = sorted(root.glob("*.desktop")) + sorted(root.glob("usr/share/applications/*.desktop"))
+    for c in candidates:
+        f = resolve(root, c)
+        if not f:
+            continue
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str
+        try:
+            cp.read(f, encoding="utf-8")
+        except configparser.Error:
+            continue
+        if cp.has_section("Desktop Entry"):
+            return dict(cp["Desktop Entry"])
+    return {}
+
+
+def find_icon(root, icon_name):
+    """Best icon for icon_name: scalable SVG, then the largest hicolor PNG,
+    then whatever sits at the top of the AppDir."""
+    icons = root / "usr/share/icons"
+    if icon_name and icons.is_dir():
+        svgs = [resolve(root, p) for p in icons.rglob(f"{icon_name}.svg")]
+        svgs = [p for p in svgs if p]
+        if svgs:
+            return svgs[0]
+
+        def size(p):
+            m = re.search(r"/(\d+)x\d+", str(p))
+            return int(m.group(1)) if m else 0
+
+        pngs = [p for p in icons.rglob(f"{icon_name}.png") if resolve(root, p)]
+        if pngs:
+            return resolve(root, max(pngs, key=size))
+    names = ([f"{icon_name}.svg", f"{icon_name}.png"] if icon_name else []) + [".DirIcon"]
+    names += [p.name for p in root.glob("*.svg")] + [p.name for p in root.glob("*.png")]
+    for n in names:
+        f = resolve(root, root / n)
+        if f:
+            return f
+    return None
+
+
+def icon_ext(path):
+    with open(path, "rb") as f:
+        head = f.read(512)
+    if head.startswith(b"\x89PNG"):
+        return ".png"
+    if b"<svg" in head or head.lstrip().startswith(b"<?xml"):
+        return ".svg"
+    return path.suffix or ".png"
+
+
+# --- naming ----------------------------------------------------------------
+
+def slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "app"
+
+
+def name_from_filename(path):
+    stem = re.sub(r"\.appimage$", "", path.name, flags=re.I)
+    stem = re.sub(r"[-_.]?(x86[-_]64|amd64|aarch64|arm64|linux|x64)", "", stem, flags=re.I)
+    stem = re.sub(r"[-_.]?v?\d+(\.\d+)+.*$", "", stem)
+    return re.sub(r"[-_.]+", " ", stem).strip() or path.stem
+
+
+def field_code(exec_line):
+    for code in FIELD_CODES:
+        if code in (exec_line or ""):
+            return code
+    return ""
+
+
+# --- install / uninstall ---------------------------------------------------
+
+def write_entry(slug, name, appimage, icon, meta):
+    exec_line = shlex.quote(str(appimage))
+    code = field_code(meta.get("Exec"))
+    if code:
+        exec_line += f" {code}"
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        f"Name={name}",
+        f"Exec={exec_line}",
+        f"TryExec={appimage}",
+        f"Icon={icon}" if icon else "Icon=application-x-executable",
+        "Terminal=false",
+    ]
+    for key in ("Comment", "GenericName", "Categories", "Keywords", "MimeType", "StartupWMClass"):
+        if meta.get(key):
+            lines.append(f"{key}={meta[key]}")
+    if "StartupWMClass" not in meta and meta.get("Exec"):
+        lines.append(f"StartupWMClass={shlex.split(meta['Exec'])[0]}")
+    lines += [
+        "X-AppImage-Installer=true",
+        "Actions=uninstall;",
+        "",
+        "[Desktop Action uninstall]",
+        "Name=Uninstall",
+        f"Exec={shlex.quote(str(UNINSTALL))} {slug}",
+        "",
+    ]
+    APPS.mkdir(parents=True, exist_ok=True)
+    entry = APPS / f"appimage-{slug}.desktop"
+    entry.write_text("\n".join(lines))
+    subprocess.run(["update-desktop-database", str(APPS)], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return entry
+
+
+def install(src):
+    src = src.resolve()
+    if not src.is_file():
+        return error(f"{src} is not a file.")
+
+    # Already installed: behave like a normal double-click and run it.
+    if ROOT in src.parents:
+        os.execv(str(src), [str(src)])
+
+    kind = appimage_type(src)
+    if kind is None:
+        return error(f"{src.name} is not an AppImage (not an ELF executable).")
+    src.chmod(src.stat().st_mode | 0o755)
+
+    with tempfile.TemporaryDirectory(prefix="appimage-install-") as tmp:
+        root = extract(src, Path(tmp), "*.desktop", "usr/share/applications/*",
+                       "usr/share/icons/*", "*.png", "*.svg", ".DirIcon")
+        meta = read_desktop(root) if root.is_dir() else {}
+        found_icon = find_icon(root, meta.get("Icon")) if root.is_dir() else None
+
+        default = meta.get("Name") or name_from_filename(src)
+        args = ["--entry", "--title=Install AppImage",
+                f"--text=Install {src.name} as:", f"--entry-text={default}"]
+        rc, name = zenity(*args)
+        if rc != 0 or not name:
+            return
+        slug = slugify(name)
+        dest_dir = ROOT / slug
+
+        old = [p for p in dest_dir.glob("*") if p.suffix.lower() == ".appimage"]
+        if old:
+            rc, _ = zenity("--question", "--title=Update AppImage", "--no-markup",
+                           f"--text={name} is already installed ({old[0].name}).\n\nReplace it with {src.name}?")
+            if rc != 0:
+                return
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        icon_path = None
+        if found_icon:
+            for stale in dest_dir.glob(f"{slug}.*"):
+                if stale.suffix in (".png", ".svg"):
+                    stale.unlink()
+            icon_path = dest_dir / f"{slug}{icon_ext(found_icon)}"
+            shutil.copyfile(found_icon, icon_path)
+
+    dest = dest_dir / src.name
+    for o in old:
+        if o.resolve() != dest:
+            o.unlink()
+    shutil.move(str(src), dest)
+    dest.chmod(0o755)
+
+    write_entry(slug, name, dest, icon_path, meta)
+    notify(f"{name} installed", "Find it in your app grid.", str(icon_path) if icon_path else None)
+    print(f"installed {name} -> {dest}")
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "--uninstall":
+        os.execv(str(UNINSTALL), [str(UNINSTALL), argv[1]])
+    if not argv:
+        rc, picked = zenity("--file-selection", "--title=Choose an AppImage",
+                            f"--filename={HOME / 'Downloads'}/",
+                            "--file-filter=AppImages | *.AppImage *.appimage")
+        if rc != 0:
+            return
+        argv = [picked]
+    for a in argv:
+        try:
+            install(Path(a))
+        except Exception as e:  # one bad file must not swallow the error silently
+            error(f"Installing {Path(a).name} failed:\n{e}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
